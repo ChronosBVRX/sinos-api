@@ -27,12 +27,12 @@ app.use(express.json({ limit: "1mb" }));
    ===================================== */
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE, // ⚠️ solo en backend
+  process.env.SUPABASE_SERVICE_ROLE, // ⚠️ solo backend
   { auth: { persistSession: false, autoRefreshToken: false } }
 );
 
 /* ===========================
-   Auth middleware (JWT)
+   Auth middleware (JWT) — para endpoints protegidos
    =========================== */
 async function requireAuth(req, res, next) {
   try {
@@ -48,6 +48,35 @@ async function requireAuth(req, res, next) {
   } catch (e) {
     console.error("Auth error:", e);
     res.status(401).json({ error: "No autorizado" });
+  }
+}
+
+/* ===========================
+   Rate limit simple por IP (para /escritor público)
+   =========================== */
+const RATE_WINDOW_MS = 60 * 60 * 1000; // 1h
+const RATE_MAX = 30; // 30 solicitudes/hora/IP
+const bucket = new Map(); // ip -> { reset:number, count:number }
+
+function rateLimit(req, res, next) {
+  try {
+    const ip = req.headers["x-forwarded-for"]?.split(",")[0].trim() || req.ip || "unknown";
+    const now = Date.now();
+    const rec = bucket.get(ip);
+
+    if (!rec || now > rec.reset) {
+      bucket.set(ip, { reset: now + RATE_WINDOW_MS, count: 1 });
+      return next();
+    }
+    if (rec.count >= RATE_MAX) {
+      const secs = Math.max(1, Math.ceil((rec.reset - now) / 1000));
+      res.status(429).json({ error: "Rate limit excedido. Intenta más tarde.", retry_after_seconds: secs });
+    } else {
+      rec.count++;
+      next();
+    }
+  } catch {
+    next();
   }
 }
 
@@ -70,7 +99,7 @@ app.get("/profile", requireAuth, (req, res) => {
   });
 });
 
-// Ejemplo CRUD básico (eco)
+// Protegida: ejemplo CRUD (eco)
 app.post("/reportes", requireAuth, async (req, res) => {
   const { titulo, contenido } = req.body || {};
   if (!titulo) return res.status(400).json({ error: "Falta título" });
@@ -78,26 +107,22 @@ app.post("/reportes", requireAuth, async (req, res) => {
 });
 
 /* ===========================================================
-   NUEVO /escritor — SOLO "cuerpo" y "despedida" (sin encabezado)
+   PÚBLICO /escritor — SOLO "cuerpo" y "despedida" (sin encabezado)
    =========================================================== */
 /**
  * POST /escritor
- * Headers: Authorization: Bearer <jwt supabase>
- * Body JSON (ejemplos):
+ * Body JSON:
  * {
  *   "tema": "Permiso sindical para asamblea",
- *   "tono": "formal",               // opcional: "formal" (default) | "neutral" | "enérgico" | etc.
- *   "hechos": [
- *      "Asamblea el 9 de octubre de 2025.",
- *      "Contrato contempla permiso con goce de sueldo."
- *   ],
- *   "extras": "Citar cláusula 12 del contrato colectivo.",
- *   "incluirDespedida": true        // por defecto true
+ *   "tono": "formal",
+ *   "hechos": ["Problema o narrativa del usuario..."],
+ *   "extras": "Instrucciones adicionales (opcional)",
+ *   "incluirDespedida": true,
+ *   "longitud": "breve|media|extensa"
  * }
- * Respuesta:
- * { "cuerpo": "...", "despedida": "..." }
+ * Respuesta: { "cuerpo": "...", "despedida": "..." }
  */
-app.post("/escritor", requireAuth, async (req, res) => {
+app.post("/escritor", rateLimit, async (req, res) => {
   try {
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
     if (!OPENAI_API_KEY) {
@@ -110,7 +135,7 @@ app.post("/escritor", requireAuth, async (req, res) => {
       hechos = [],
       extras = "",
       incluirDespedida = true,
-      longitud = "media"  // "breve" (~100-150 palabras), "media" (~180-260), "extensa" (~300-450)
+      longitud = "media"
     } = req.body || {};
 
     const longHint =
@@ -118,7 +143,6 @@ app.post("/escritor", requireAuth, async (req, res) => {
       longitud === "extensa" ? "Extensión amplia (300–450 palabras)." :
       "Extensión media (180–260 palabras).";
 
-    // Prompt: instruimos que NO incluya fecha, destinatario, ni firma
     const prompt = [
       `Redacta ÚNICAMENTE el CUERPO del texto (sin encabezado, sin fecha, sin destinatario, sin firma).`,
       `Tema: ${tema}.`,
@@ -162,17 +186,15 @@ app.post("/escritor", requireAuth, async (req, res) => {
     const data = await r.json();
     let content = data?.choices?.[0]?.message?.content || "";
 
-    // Intentamos parsear el JSON que pedimos al modelo
+    // Intentamos parsear el JSON
     let cuerpo = "", despedida = "";
     try {
-      // Si llega con espacios/markdown, extraer el bloque JSON
       const match = content.match(/\{[\s\S]*\}/);
       const jsonText = match ? match[0] : content;
       const obj = JSON.parse(jsonText);
       cuerpo = (obj.cuerpo || "").toString().trim();
       despedida = (obj.despedida || "").toString().trim();
     } catch {
-      // Fallback: devolvemos todo como cuerpo
       cuerpo = content.trim();
       despedida = incluirDespedida ? "Quedo atento a su respuesta." : "";
     }
