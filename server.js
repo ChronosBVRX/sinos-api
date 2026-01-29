@@ -16,7 +16,7 @@ app.use(cors({
     // permitir llamadas sin Origin (curl/healthchecks)
     if (!origin) return cb(null, true);
     if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-    return cb(new Error("CORS blocked for origin: " + origin), false);
+return cb(null, false);
   },
   credentials: true,
 }));
