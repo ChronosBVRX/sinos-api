@@ -3,9 +3,22 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
+import { createServer } from "http"; // NUEVO: Requerido para WebSockets
+import { Server } from "socket.io"; // NUEVO: Importar Socket.io
 
 dotenv.config();
 const app = express();
+
+/* =====================================
+   NUEVO: Configuración de Servidor HTTP y WebSockets
+   ===================================== */
+const httpServer = createServer(app);
+const io = new Server(httpServer, {
+  cors: {
+    origin: "*", // Permite que el kiosko y celular se conecten sin bloqueos de CORS
+    methods: ["GET", "POST"]
+  }
+});
 
 /* =========================
    CORS: GitHub Pages origin
@@ -16,7 +29,7 @@ app.use(cors({
     // permitir llamadas sin Origin (curl/healthchecks)
     if (!origin) return cb(null, true);
     if (allowed.length === 0 || allowed.includes(origin)) return cb(null, true);
-return cb(null, false);
+    return cb(null, false);
   },
   credentials: true,
 }));
@@ -70,7 +83,7 @@ function rateLimit(req, res, next) {
     }
     if (rec.count >= RATE_MAX) {
       const secs = Math.max(1, Math.ceil((rec.reset - now) / 1000));
-      res.status(429).json({ error: "Rate limit excedido. Intenta más tarde.", retry_after_seconds: secs });
+      return res.status(429).json({ error: "Rate limit excedido. Intenta más tarde.", retry_after_seconds: secs });
     } else {
       rec.count++;
       next();
@@ -109,19 +122,6 @@ app.post("/reportes", requireAuth, async (req, res) => {
 /* ===========================================================
    PÚBLICO /escritor — SOLO "cuerpo" y "despedida" (sin encabezado)
    =========================================================== */
-/**
- * POST /escritor
- * Body JSON:
- * {
- *   "tema": "Permiso sindical para asamblea",
- *   "tono": "formal",
- *   "hechos": ["Problema o narrativa del usuario..."],
- *   "extras": "Instrucciones adicionales (opcional)",
- *   "incluirDespedida": true,
- *   "longitud": "breve|media|extensa"
- * }
- * Respuesta: { "cuerpo": "...", "despedida": "..." }
- */
 app.post("/escritor", rateLimit, async (req, res) => {
   try {
     const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -206,8 +206,34 @@ app.post("/escritor", rateLimit, async (req, res) => {
   }
 });
 
+/* ===========================================================
+   NUEVO: LÓGICA DEL KIOSKO (WEBSOCKETS)
+   =========================================================== */
+io.on('connection', (socket) => {
+  console.log('📱 Un dispositivo se conectó al Kiosko:', socket.id);
+
+  // 1. El Kiosko crea una sala de espera con su código QR
+  socket.on('crear-sesion', (idSesion) => {
+    socket.join(idSesion);
+    console.log(`📡 Kiosko esperando documentos en la sala: ${idSesion}`);
+  });
+
+  // 2. El Celular envía el documento procesado a esa sala específica
+  socket.on('enviar-documento', (data) => {
+    // data trae la sesión y la imagen en base64
+    io.to(data.sesion).emit('documento-recibido', data.archivo);
+    console.log(`✅ Documento transferido con éxito a la sala: ${data.sesion}`);
+  });
+
+  socket.on('disconnect', () => {
+    console.log('❌ Dispositivo desconectado');
+  });
+});
+
 /* ===========================
    Arranque
    =========================== */
 const port = process.env.PORT || 10000;
-app.listen(port, () => console.log("✅ API escuchando en puerto", port));
+
+// NUEVO: Cambiamos app.listen por httpServer.listen
+httpServer.listen(port, () => console.log("✅ API + Kiosko escuchando en puerto", port));
